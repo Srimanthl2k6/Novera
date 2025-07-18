@@ -1,2 +1,22 @@
-node_modules
+# Node modules
+node_modules/
+
+# Environment variables
 .env
+
+# Uploads directory
+# IMPORTANT: For persistent file storage on Vercel, you need cloud storage (e.g., AWS S3, Cloudinary).
+# Files uploaded to 'uploads/' on Vercel's ephemeral filesystem will be lost.
+uploads/
+
+# Log files
+*.log
+npm-debug.log*
+
+# OS generated files
+.DS_Store
+.vscode/
+
+# Build artifacts
+dist/
+build/
