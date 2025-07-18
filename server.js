@@ -810,4 +810,665 @@ app.post('/api/pages', [
   authenticateToken,
   body('title')
     .trim()
+    .isLength({ min: 1, max: 200 })
+    .withMessage('Title must be between 1 and 200 characters'),
+  body('components')
+    .optional()
+    .isArray({ max: 50 })
+    .withMessage('Components must be an array with maximum 50 items'),
+  body('settings')
+    .optional()
+    .isObject()
+    .withMessage('Settings must be an object')
+], validateRequest, async (req, res) => {
+  const session = await mongoose.startSession();
   
+  try {
+    await session.withTransaction(async () => {
+      const { title, components = [], settings = {} } = req.body;
+
+      // Generate unique slug with transaction
+      const baseSlug = title.toLowerCase()
+        .replace(/[^a-z0-9]/g, '-')
+        .replace(/-+/g, '-')
+        .replace(/^-|-$/g, '')
+        .substring(0, 50);
+
+      let slug = baseSlug;
+      let counter = 1;
+      
+      while (await LandingPage.findOne({ slug }).session(session)) {
+        slug = `${baseSlug}-${counter}`;
+        counter++;
+      }
+
+      // Sanitize components
+      const sanitizedComponents = components.map(component => {
+        if (component.content) {
+          Object.keys(component.content).forEach(key => {
+            if (typeof component.content[key] === 'string') {
+              component.content[key] = sanitizeHTML(component.content[key]);
+            }
+          });
+        }
+        return component;
+      });
+
+      const page = new LandingPage({
+        title,
+        slug,
+        components: sanitizedComponents,
+        settings: {
+          theme: settings.theme || 'modern',
+          primaryColor: settings.primaryColor || '#6366f1',
+          secondaryColor: settings.secondaryColor || '#f59e0b',
+          font: settings.font || 'Inter'
+        },
+        createdBy: req.user.userId
+      });
+
+      await page.save({ session });
+      
+      res.status(201).json({
+        success: true,
+        message: 'Page created successfully with Novera!',
+        page,
+        requestId: req.id
+      });
+    });
+  } catch (error) {
+    console.error('Create page error:', error, { requestId: req.id });
+    res.status(500).json({
+      success: false,
+      message: 'Server error',
+      requestId: req.id
+    });
+  } finally {
+    await session.endSession();
+  }
+});
+
+// Update page
+app.put('/api/pages/:id', [
+  authenticateToken,
+  body('title')
+    .optional()
+    .trim()
+    .isLength({ min: 1, max: 200 })
+    .withMessage('Title must be between 1 and 200 characters'),
+  body('components')
+    .optional()
+    .isArray({ max: 50 })
+    .withMessage('Components must be an array with maximum 50 items'),
+  body('settings')
+    .optional()
+    .isObject()
+    .withMessage('Settings must be an object')
+], validateRequest, async (req, res) => {
+  try {
+    const { title, components, settings, isPublished } = req.body;
+
+    const page = await LandingPage.findOne({
+      _id: req.params.id,
+      createdBy: req.user.userId
+    });
+
+    if (!page) {
+      return res.status(404).json({
+        success: false,
+        message: 'Page not found',
+        requestId: req.id
+      });
+    }
+
+    // Update fields
+    if (title) page.title = title;
+    if (components) {
+      const sanitizedComponents = components.map(component => {
+        if (component.content) {
+          Object.keys(component.content).forEach(key => {
+            if (typeof component.content[key] === 'string') {
+              component.content[key] = sanitizeHTML(component.content[key]);
+            }
+          });
+        }
+        return component;
+      });
+      page.components = sanitizedComponents;
+    }
+    if (settings) {
+      page.settings = { ...page.settings, ...settings };
+    }
+    if (typeof isPublished === 'boolean') {
+      page.isPublished = isPublished;
+    }
+
+    await page.save();
+
+    res.json({
+      success: true,
+      message: 'Page updated successfully!',
+      page,
+      requestId: req.id
+    });
+  } catch (error) {
+    console.error('Update page error:', error, { requestId: req.id });
+    res.status(500).json({
+      success: false,
+      message: 'Server error',
+      requestId: req.id
+    });
+  }
+});
+
+// Delete page
+app.delete('/api/pages/:id', authenticateToken, async (req, res) => {
+  try {
+    const page = await LandingPage.findOne({
+      _id: req.params.id,
+      createdBy: req.user.userId
+    });
+
+    if (!page) {
+      return res.status(404).json({
+        success: false,
+        message: 'Page not found',
+        requestId: req.id
+      });
+    }
+
+    await LandingPage.deleteOne({ _id: req.params.id });
+
+    // Clean up analytics (time series collection will handle expiration automatically)
+    await Analytics.deleteMany({ pageId: req.params.id });
+
+    res.json({
+      success: true,
+      message: 'Page deleted successfully',
+      requestId: req.id
+    });
+  } catch (error) {
+    console.error('Delete page error:', error, { requestId: req.id });
+    res.status(500).json({
+      success: false,
+      message: 'Server error',
+      requestId: req.id
+    });
+  }
+});
+
+// Page export
+app.get('/api/pages/:id/export', authenticateToken, async (req, res) => {
+  try {
+    const page = await LandingPage.findOne({
+      _id: req.params.id,
+      createdBy: req.user.userId
+    });
+
+    if (!page) {
+      return res.status(404).json({
+        success: false,
+        message: 'Page not found',
+        requestId: req.id
+      });
+    }
+
+    const html = generateHTML(page);
+    res.setHeader('Content-Type', 'text/html');
+    res.setHeader('Content-Disposition', `attachment; filename="${page.slug}.html"`);
+    res.send(html);
+  } catch (error) {
+    console.error('Export page error:', error, { requestId: req.id });
+    res.status(500).json({
+      success: false,
+      message: 'Server error',
+      requestId: req.id
+    });
+  }
+});
+
+// Public page view (Fixed race condition)
+app.get('/api/public/:slug', async (req, res) => {
+  try {
+    const page = await LandingPage.findOneAndUpdate(
+      { slug: req.params.slug, isPublished: true },
+      { $inc: { views: 1 } },
+      { new: true }
+    );
+
+    if (!page) {
+      return res.status(404).json({
+        success: false,
+        message: 'Page not found',
+        requestId: req.id
+      });
+    }
+
+    // Track view analytics in time series collection
+    const analytics = new Analytics({
+      pageId: page._id,
+      event: 'view',
+      timestamp: new Date(),
+      userAgent: req.get('User-Agent'),
+      ip: getClientIP(req),
+      data: {
+        slug: page.slug,
+        title: page.title
+      }
+    });
+    await analytics.save();
+
+    res.json({
+      success: true,
+      page: {
+        title: page.title,
+        components: page.components,
+        settings: page.settings,
+        views: page.views,
+        poweredBy: 'Novera - Error 404 : Developer Not needed'
+      },
+      requestId: req.id
+    });
+  } catch (error) {
+    console.error('Public page error:', error, { requestId: req.id });
+    res.status(500).json({
+      success: false,
+      message: 'Server error',
+      requestId: req.id
+    });
+  }
+});
+
+// ================================
+// UPLOAD ROUTES
+// ================================
+
+app.post('/api/upload', authenticateToken, upload.single('image'), (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        message: 'No file uploaded',
+        requestId: req.id
+      });
+    }
+
+    const fileUrl = `/uploads/${req.file.filename}`;
+    res.json({
+      success: true,
+      message: 'File uploaded successfully to Novera!',
+      url: fileUrl,
+      filename: req.file.filename,
+      size: req.file.size,
+      requestId: req.id
+    });
+  } catch (error) {
+    console.error('Upload error:', error, { requestId: req.id });
+    res.status(500).json({
+      success: false,
+      message: 'Upload failed',
+      requestId: req.id
+    });
+  }
+});
+
+// ================================
+// ANALYTICS ROUTES
+// ================================
+
+// Track analytics (Enhanced for time series)
+app.post('/api/analytics/track', [
+  body('pageId')
+    .isMongoId()
+    .withMessage('Invalid page ID'),
+  body('event')
+    .isIn(['view', 'click', 'submit', 'download'])
+    .withMessage('Invalid event type'),
+  body('element')
+    .optional()
+    .isLength({ max: 100 })
+    .withMessage('Element name too long'),
+  body('text')
+    .optional()
+    .isLength({ max: 500 })
+    .withMessage('Text too long'),
+  body('data')
+    .optional()
+    .custom(value => {
+      if (typeof value === 'object' && JSON.stringify(value).length > 1000) {
+        throw new Error('Data object too large');
+      }
+      return true;
+    })
+], validateRequest, async (req, res) => {
+  try {
+    const { pageId, event, element, text, data } = req.body;
+
+    // Verify page exists
+    const page = await LandingPage.findById(pageId);
+    if (!page) {
+      return res.status(404).json({
+        success: false,
+        message: 'Page not found',
+        requestId: req.id
+      });
+    }
+
+    // Create analytics entry optimized for time series
+    const analytics = new Analytics({
+      pageId: new mongoose.Types.ObjectId(pageId),
+      event,
+      timestamp: new Date(),
+      data: { 
+        element, 
+        text, 
+        pageTitle: page.title,
+        pageSlug: page.slug,
+        ...data 
+      },
+      userAgent: req.get('User-Agent'),
+      ip: getClientIP(req)
+    });
+
+    await analytics.save();
+
+    res.status(201).json({
+      success: true,
+      message: 'Event tracked successfully',
+      requestId: req.id
+    });
+  } catch (error) {
+    console.error('Track error:', error, { requestId: req.id });
+    res.status(500).json({
+      success: false,
+      message: 'Tracking failed',
+      requestId: req.id
+    });
+  }
+});
+
+// Get analytics for a page (Optimized for time series)
+app.get('/api/analytics/:pageId', authenticateToken, async (req, res) => {
+  try {
+    const page = await LandingPage.findOne({
+      _id: req.params.pageId,
+      createdBy: req.user.userId
+    });
+
+    if (!page) {
+      return res.status(404).json({
+        success: false,
+        message: 'Page not found',
+        requestId: req.id
+      });
+    }
+
+    const analyticsPage = parseInt(req.query.page) || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 100, 1000);
+    const skip = (analyticsPage - 1) * limit;
+
+    // Time series optimized aggregation
+    const pageObjectId = new mongoose.Types.ObjectId(req.params.pageId);
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+
+    const [recentEvents, aggregatedData] = await Promise.all([
+      Analytics.find({ 
+        pageId: pageObjectId,
+        timestamp: { $gte: thirtyDaysAgo }
+      })
+      .sort({ timestamp: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean(),
+      
+      Analytics.aggregate([
+        { 
+          $match: { 
+            pageId: pageObjectId,
+            timestamp: { $gte: thirtyDaysAgo }
+          } 
+        },
+        {
+          $group: {
+            _id: null,
+            totalEvents: { $sum: 1 },
+            eventsByType: {
+              $push: {
+                event: '$event',
+                timestamp: '$timestamp'
+              }
+            }
+          }
+        }
+      ])
+    ]);
+
+    // Process aggregated data for time series analytics
+    const eventCounts = {};
+    const dailyViews = {};
+    const hourlyViews = {};
+    
+    if (aggregatedData.length > 0) {
+      aggregatedData[0].eventsByType.forEach(event => {
+        eventCounts[event.event] = (eventCounts[event.event] || 0) + 1;
+        
+        if (event.event === 'view') {
+          const date = new Date(event.timestamp).toISOString().split('T')[0];
+          const hour = new Date(event.timestamp).toISOString().split('T')[1].split(':')[0];
+          
+          dailyViews[date] = (dailyViews[date] || 0) + 1;
+          hourlyViews[`${date}-${hour}`] = (hourlyViews[`${date}-${hour}`] || 0) + 1;
+        }
+      });
+    }
+
+    const totalEvents = aggregatedData.length > 0 ? aggregatedData[0].totalEvents : 0;
+
+    res.json({
+      success: true,
+      analytics: {
+        totalEvents,
+        eventCounts,
+        dailyViews,
+        hourlyViews,
+        recentEvents: recentEvents.slice(0, 50),
+        pagination: {
+          currentPage: analyticsPage,
+          totalPages: Math.ceil(totalEvents / limit),
+          totalItems: totalEvents,
+          itemsPerPage: limit
+        },
+        dataRetention: '30 days (automatic)',
+        collectionType: 'time-series'
+      },
+      requestId: req.id
+    });
+  } catch (error) {
+    console.error('Analytics error:', error, { requestId: req.id });
+    res.status(500).json({
+      success: false,
+      message: 'Server error',
+      requestId: req.id
+    });
+  }
+});
+
+// ================================
+// UTILITY FUNCTIONS
+// ================================
+
+// Generate HTML utility (Enhanced with HTML escaping)
+function generateHTML(page) {
+  const componentsHTML = page.components.map(component => {
+    switch (component.type) {
+      case 'hero':
+        const { heading, subheading, backgroundImage, ctaText, ctaLink } = component.content;
+        return `
+          <section style="
+            background-image: url('${escapeHtml(backgroundImage || '')}');
+            background-size: cover;
+            background-position: center;
+            padding: 80px 20px;
+            text-align: center;
+            color: white;
+            min-height: 60vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+          ">
+            <h1 style="font-size: 3rem; margin-bottom: 1rem; font-weight: bold;">
+              ${escapeHtml(heading || 'Welcome to Novera')}
+            </h1>
+            <p style="font-size: 1.25rem; margin-bottom: 2rem; max-width: 600px;">
+              ${escapeHtml(subheading || 'Error 404 : Developer Not needed')}
+            </p>
+            ${ctaText && ctaLink ? `
+              <a href="${escapeHtml(ctaLink)}" style="
+                background-color: ${escapeHtml(page.settings.primaryColor)};
+                color: white;
+                padding: 12px 24px;
+                border-radius: 8px;
+                text-decoration: none;
+                font-weight: bold;
+                display: inline-block;
+              ">${escapeHtml(ctaText)}</a>
+            ` : ''}
+          </section>
+        `;
+      
+      case 'text':
+        const { content } = component.content;
+        return `
+          <section style="padding: 60px 20px; max-width: 800px; margin: 0 auto;">
+            <div style="line-height: 1.6;">${sanitizeHTML(content || '')}</div>
+          </section>
+        `;
+      
+      case 'image':
+        const { src, alt, caption } = component.content;
+        return `
+          <section style="padding: 40px 20px; text-align: center;">
+            <img src="${escapeHtml(src || '')}" alt="${escapeHtml(alt || '')}" style="max-width: 100%; height: auto; border-radius: 8px;">
+            ${caption ? `<p style="margin-top: 1rem; font-style: italic; color: #666;">${escapeHtml(caption)}</p>` : ''}
+          </section>
+        `;
+      
+      default:
+        return '';
+    }
+  }).join('\n');
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escapeHtml(page.title)}</title>
+  <meta name="generator" content="Novera - Error 404 : Developer Not needed">
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    body {
+      font-family: ${escapeHtml(page.settings.font)}, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      line-height: 1.6;
+      color: #333;
+    }
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 0 20px;
+    }
+    .novera-footer {
+      position: fixed;
+      bottom: 10px;
+      right: 10px;
+      background: rgba(0,0,0,0.8);
+      color: white;
+      padding: 5px 10px;
+      border-radius: 5px;
+      font-size: 12px;
+      z-index: 1000;
+    }
+  </style>
+</head>
+<body>
+  ${componentsHTML}
+  <div class="novera-footer">
+    Powered by Novera
+  </div>
+</body>
+</html>`;
+}
+
+// Enhanced error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Error:', error, { requestId: req.id });
+  
+  if (error instanceof multer.MulterError) {
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({
+        success: false,
+        message: 'File size too large',
+        requestId: req.id
+      });
+    }
+  }
+  
+  if (error.message === 'Not allowed by CORS') {
+    return res.status(403).json({
+      success: false,
+      message: 'CORS policy violation',
+      requestId: req.id
+    });
+  }
+  
+  res.status(500).json({
+    success: false,
+    message: 'Something went wrong',
+    requestId: req.id
+  });
+});
+
+// 404 handler
+app.use('*', (req, res) => {
+  res.status(404).json({
+    success: false,
+    message: 'Route not found - Maybe you need Novera to build it?',
+    tagline: 'Error 404 : Developer Not needed',
+    requestId: req.id
+  });
+});
+
+// Enhanced graceful shutdown
+const gracefulShutdown = async (signal) => {
+  console.log(`Received ${signal}. Shutting down gracefully...`);
+  
+  try {
+    // Close mongoose connection
+    await mongoose.connection.close();
+    console.log('MongoDB connection closed');
+    
+    // Close the server
+    process.exit(0);
+  } catch (error) {
+    console.error('Error during shutdown:', error);
+    process.exit(1);
+  }
+};
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+
+// Start server
+app.listen(PORT, () => {
+  console.log(`🚀 Novera Backend running on port ${PORT}`);
+  console.log(`📝 "Error 404 : Developer Not needed"`);
+  console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`📊 Analytics: Time Series Collections`);
+});
+
+module.exports = app;
